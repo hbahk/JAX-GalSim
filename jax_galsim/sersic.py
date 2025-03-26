@@ -516,18 +516,11 @@ class Sersic(GSObject):
             (
                 a
                 - b
-                / (
-                    jnp.sqrt(
-                        (
-                            a
-                            - b
-                            / (jnp.sqrt(a - b / (jnp.sqrt(a / thres)) / thres))
-                            / thres
-                        )
-                    )
+                / jnp.sqrt(
+                    (a - b / jnp.sqrt((a - b / jnp.sqrt(a / thres)) / thres)) / thres
                 )
-                / thres
             )
+            / thres
         )
 
         # Predict f0 from high-k approx
