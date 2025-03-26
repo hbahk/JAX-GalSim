@@ -83,7 +83,7 @@ def sersic_integrated_flux(n, r):
     z = r ** (1.0 / n)
     return gammainc(2.0 * n, z)
 
-# TODO: Implement this function in JAX
+
 @jit
 def calculate_truncated_scale(n, invn, b, trunc):
     """
@@ -299,10 +299,10 @@ class Sersic(GSObject):
         return hash(
             (
                 "galsim.SBSersic",
-                self.n,
-                self.scale_radius,
-                self.trunc,
-                self.flux,
+                ensure_hashable(self.n),
+                ensure_hashable(self.scale_radius),
+                ensure_hashable(self.trunc),
+                ensure_hashable(self.flux),
                 self.gsparams,
             )
         )
@@ -310,7 +310,13 @@ class Sersic(GSObject):
     def __repr__(self):
         return (
             "galsim.Sersic(n=%r, scale_radius=%r, trunc=%r, flux=%r, gsparams=%r)"
-            % (self.n, self.scale_radius, self.trunc, self.flux, self.gsparams)
+            % (
+                ensure_hashable(self.n),
+                ensure_hashable(self.scale_radius),
+                ensure_hashable(self.trunc),
+                ensure_hashable(self.flux),
+                self.gsparams,
+            )
         )
 
     def __str__(self):
@@ -318,13 +324,13 @@ class Sersic(GSObject):
         # the constructor, so it should be exact.  But most people use half_light_radius
         # for Sersics, so use that in the looser str() function.
         s = "galsim.Sersic(n=%s, half_light_radius=%s" % (
-            self.n,
-            self.half_light_radius,
+            ensure_hashable(self.n),
+            ensure_hashable(self.half_light_radius),
         )
         if self.trunc != 0.0:
-            s += ", trunc=%s" % self.trunc
+            s += ", trunc=%s" % ensure_hashable(self.trunc)
         if self.flux != 1.0:
-            s += ", flux=%s" % self.flux
+            s += ", flux=%s" % ensure_hashable(self.flux)
         s += ")"
         return s
 
@@ -363,9 +369,13 @@ class Sersic(GSObject):
     def _xValue(self, pos):
         rsq = (pos.x**2 + pos.y**2) / (self._r0 * self._r0)
         _truncated = (self.trunc_factor > 0) and (rsq > self.trunc**2)
-        _xvalue = jnp.select(
-            [_truncated, ~_truncated], [0.0, jnp.exp(-jnp.power(rsq, 0.5 / self._n))]
-        ) * self._max_sb
+        _xvalue = (
+            jnp.select(
+                [_truncated, ~_truncated],
+                [0.0, jnp.exp(-jnp.power(rsq, 0.5 / self._n))],
+            )
+            * self._max_sb
+        )
 
         return _xvalue
 
@@ -391,7 +401,9 @@ class Sersic(GSObject):
         return _kvalue
 
     def _shoot(self, photons, rng):
-        raise NotImplementedError("Sersic profiles are not yet implemented in the shooting API.")
+        raise NotImplementedError(
+            "Sersic profiles are not yet implemented in the shooting API."
+        )
         # self._sbp.shoot(photons._pa, rng._rng)
 
     def _drawReal(self, image, jac=None, offset=(0.0, 0.0), flux_scaling=1.0):
@@ -463,7 +475,7 @@ class Sersic(GSObject):
             case_general,
         )
 
-        return z ** self._n
+        return z**self._n
 
     def _sersic_truncated_scale(self, n, hlr, trunc):
         """Calculate the truncated scale for the Sersic profile."""
@@ -617,15 +629,22 @@ class DeVaucouleurs(Sersic):
     def __repr__(self):
         return (
             "galsim.DeVaucouleurs(scale_radius=%r, trunc=%r, flux=%r, gsparams=%r)"
-            % (self.scale_radius, self.trunc, self.flux, self.gsparams)
+            % (
+                ensure_hashable(self.scale_radius),
+                ensure_hashable(self.trunc),
+                ensure_hashable(self.flux),
+                self.gsparams,
+            )
         )
 
     def __str__(self):
-        s = "galsim.DeVaucouleurs(half_light_radius=%s" % self.half_light_radius
+        s = "galsim.DeVaucouleurs(half_light_radius=%s" % ensure_hashable(
+            self.half_light_radius
+        )
         if self.trunc != 0.0:
-            s += ", trunc=%s" % self.trunc
+            s += ", trunc=%s" % ensure_hashable(self.trunc)
         if self.flux != 1.0:
-            s += ", flux=%s" % self.flux
+            s += ", flux=%s" % ensure_hashable(self.flux)
         s += ")"
         return s
 
