@@ -5,6 +5,7 @@ from jax import jit, vmap
 from jax.scipy.special import gamma, gammainc
 from jax.tree_util import register_pytree_node_class
 from jax.tree_util import Partial as partial
+from interax import interp1d
 
 from jax_galsim.core.draw import draw_by_kValue, draw_by_xValue
 from jax_galsim.core.utils import bisect_for_root, ensure_hashable, implements
@@ -35,7 +36,6 @@ class SersicTruncatedHLR:
         return (2 * f1 - f2) * gamma(self._2n)
 
 
-# TODO: remove scipy dependency!!
 @jit
 def calculate_b(n, invn, gamma2n, flux_fraction):
     """
@@ -165,6 +165,7 @@ class Sersic(GSObject):
         self._b = None
         self.__stepk = 0.0
         self.__maxk = 0.0
+        self._ft_table_fvals = None
 
         if self._n < Sersic._minimum_n:
             raise _galsim.GalSimRangeError(
@@ -356,18 +357,51 @@ class Sersic(GSObject):
     def _has_hard_edges(self):
         return self._trunc != 0.0
 
+    def get_xnorm(self):
+        return 1.0 / (2.0 * jnp.pi * self._n * self.gamma2n * self._flux_fraction)
+
+    @property
+    def _shootnorm(self):
+        return self.get_xnorm() * self._flux
+
     @property
     def _max_sb(self):
-        return self._sbp.maxSB()
+        _inv_r0_sq = 1.0 / (self._r0 * self._r0)
+        return _inv_r0_sq * self._shootnorm
 
     def _xValue(self, pos):
-        return self._sbp.xValue(pos._p)
+        rsq = (pos.x**2 + pos.y**2) / (self._r0 * self._r0)
+        _truncated = (self.trunc_factor > 0) and (rsq > self.trunc**2)
+        _xvalue = jnp.select(
+            [_truncated, ~_truncated], [0.0, jnp.exp(-jnp.power(rsq, 0.5 / self._n))]
+        ) * self._max_sb
+
+        return _xvalue
 
     def _kValue(self, kpos):
-        return self._sbp.kValue(kpos._p)
+        ksq = (kpos.x**2 + kpos.y**2) * self._r0 * self._r0
+
+        jax.lax.cond(
+            self._ft_table_fvals is None,
+            lambda: self.build_FT(),
+            lambda: None,
+        )
+
+        _kvalue = jnp.select(
+            [ksq < self._ksq_min, ksq >= self._ksq_max],
+            [
+                1.0 + ksq * (self._kderiv2 + ksq * self._kderiv4),
+                (self._highk_a + self._highk_b / jnp.sqrt(ksq)) / ksq,
+            ],
+            interp1d(0.5 * jnp.log(ksq), self._ft_table_logk, self._ft_table_fvals)
+            / ksq,
+        )
+
+        return _kvalue
 
     def _shoot(self, photons, rng):
-        self._sbp.shoot(photons._pa, rng._rng)
+        raise NotImplementedError("Sersic profiles are not yet implemented in the shooting API.")
+        # self._sbp.shoot(photons._pa, rng._rng)
 
     def _drawReal(self, image, jac=None, offset=(0.0, 0.0), flux_scaling=1.0):
         _jac = jnp.eye(2) if jac is None else jac
@@ -401,6 +435,7 @@ class Sersic(GSObject):
         missing_flux = missing_flux_frac * self.gamma2n
         z1 = -jnp.log(missing_flux)
 
+        # TODO: replace this with jax
         if self._n == 0.5:
             z = z1  # Exact formula for n = 0.5
         else:
@@ -422,7 +457,7 @@ class Sersic(GSObject):
             if z1 < 0.0:
                 z1 = self.b
 
-            func = SersicMissingFlux(self._n, missing_flux)
+            func = SersicMissingFlux(self._n, missing_flux).__call__
             pfunc = partial(func)
             z = bisect_for_root(pfunc, z1, z2)
 
@@ -487,7 +522,6 @@ class Sersic(GSObject):
         f_vals /= hankel_norm
         f0_vals = f_vals * ksq
 
-        # TODO: check this!!
         # Fit a/k^2 + b/k^3 to last `n_fit` values
         n_fit = 10
         tail_idx = -n_fit
@@ -528,16 +562,20 @@ class Sersic(GSObject):
         maxk = jnp.sqrt(ksq_max)
 
         # Store values for use elsewhere
-        self.kmin = kmin
-        self.ksq_min = ksq_min
-        self.ksq_max = ksq_max
+        self._kmin = kmin
+        self._ksq_min = ksq_min
+        self._ksq_max = ksq_max
         self._maxk = maxk
-        self.kderiv2 = kderiv2
-        self.kderiv4 = kderiv4
-        self.highk_a = a
-        self.highk_b = b
+        self._kderiv2 = kderiv2
+        self._kderiv4 = kderiv4
+        self._highk_a = a
+        self._highk_b = b
         self._found_maxk = found_maxk
         self._approx_k_at_thres = _approx_k_at_thres
+
+        # Build the lookup table
+        self._ft_table_logk = logk
+        self._ft_table_fvals = f_vals
 
 
 @implements(_galsim.DeVaucouleurs)
