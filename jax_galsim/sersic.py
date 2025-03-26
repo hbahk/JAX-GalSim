@@ -83,7 +83,7 @@ def sersic_integrated_flux(n, r):
     z = r ** (1.0 / n)
     return gammainc(2.0 * n, z)
 
-
+# TODO: Implement this function in JAX
 @jit
 def calculate_truncated_scale(n, invn, b, trunc):
     """
@@ -98,17 +98,17 @@ def calculate_truncated_scale(n, invn, b, trunc):
     Returns:
     float: Truncated scale radius in units of the half-light radius
     """
-    if trunc <= jnp.sqrt(2.0):
-        raise ValueError(
-            "Sersic truncation must be larger than sqrt(2)*half_light_radius."
-        )
 
     x = trunc**invn
 
     b1 = (jnp.log(0.5) + (2 * n - 1) * jnp.log(x)) / (x - 1)
 
-    if b1 < 1.0e-3 * b:
-        b1 = b / 2
+    b1 = jax.lax.cond(
+        b1 < 1.0e-3 * b,
+        lambda b1: b / 2,
+        lambda b1: b1,
+        operand=b1,
+    )
 
     b2 = b
     func = SersicTruncatedHLR(n, x)
@@ -162,9 +162,6 @@ class Sersic(GSObject):
         self._flux = float(flux)
         self._trunc = float(trunc)
 
-        self._b = None
-        self.__stepk = 0.0
-        self.__maxk = 0.0
         self._ft_table_fvals = None
 
         if self._n < Sersic._minimum_n:
@@ -208,7 +205,6 @@ class Sersic(GSObject):
 
         elif scale_radius is not None:
             self._r0 = float(scale_radius)
-            self._hlr = 0.0
         else:
             raise _galsim.GalSimIncompatibleValuesError(
                 "Either scale_radius or half_light_radius must be specified for Spergel",
@@ -223,11 +219,25 @@ class Sersic(GSObject):
             if flux_untruncated:
                 # Then update the flux and hlr with the correct values
                 self._flux *= self._flux_fraction
-                self._hlr = (
-                    0.0  # This will be updated by getHalfLightRadius if necessary.
-                )
         else:
             self._flux_fraction = 1.0
+
+        # Recalculate the half-light radius with finalized _flux_fraction
+        self._hlr = self._r0 * self.calculateHLRFactor()
+
+        # Calculate the parameter b
+        self._b = calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
+
+        # Initialize the FT lookup table
+        self._build_FT()
+
+        # Initialize the stepk values
+        R = self._calculate_missing_flux_radius(self.gsparams.folding_threshold)
+        if self._flux_fraction < 1.0 and self.trunc_factor < R:
+            R = self.trunc_factor
+        # Make sure it is at least 5 hlr
+        R = jnp.max(jnp.array([R, self.gsparams.stepk_minimum_hlr]))
+        self.__stepk = jnp.pi / R
 
     def calculateIntegratedFlux(self, r):
         """Return the fraction of the total flux enclosed within a given radius, r"""
@@ -237,7 +247,7 @@ class Sersic(GSObject):
 
     def calculateHLRFactor(self):
         """Calculate the half-light-radius in units of the scale radius."""
-        return self.b**self._n
+        return self._b**self._n
 
     # @lazy_property
     # def _sbp(self):
@@ -269,21 +279,11 @@ class Sersic(GSObject):
     @property
     def half_light_radius(self):
         """The half-light radius."""
-        if self._hlr == 0.0:
-            self._hlr = self._r0 * self.calculateHLRFactor()
         return self._hlr
 
     @property
     def gamma2n(self):
         return gamma(2.0 * self._n)
-
-    @property
-    def b(self):
-        if self._b is None:
-            self._b = calculate_b(
-                self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction
-            )
-        return self._b
 
     def __eq__(self, other):
         return self is other or (
@@ -330,7 +330,7 @@ class Sersic(GSObject):
 
     def __getstate__(self):
         d = self.__dict__.copy()
-        d.pop("_sbp", None)
+        # d.pop("_sbp", None)
         return d
 
     def __setstate__(self, d):
@@ -338,19 +338,10 @@ class Sersic(GSObject):
 
     @property
     def _maxk(self):
-        if self.__maxk == 0.0:
-            self.__maxk = self.build_FT()
         return self.__maxk
 
     @property
     def _stepk(self):
-        if self.__stepk == 0.0:
-            R = self._calculate_missing_flux_radius(self.gsparams.folding_threshold)
-            if self._flux_fraction < 1.0 and self.trunc_factor < R:
-                R = self.trunc_factor
-            # Make sure it is at least 5 hlr
-            R = jnp.max(jnp.array([R, self.gsparams.stepk_minimum_hlr]))
-            self.__stepk = jnp.pi / R
         return self.__stepk
 
     @property
@@ -383,7 +374,7 @@ class Sersic(GSObject):
 
         jax.lax.cond(
             self._ft_table_fvals is None,
-            lambda: self.build_FT(),
+            lambda: self._build_FT(),
             lambda: None,
         )
 
@@ -421,7 +412,7 @@ class Sersic(GSObject):
             gsparams=self.gsparams,
         )
 
-    @jit
+    @jax.jit
     def _calculate_missing_flux_radius(self, missing_flux_frac):
         """
         Find the radius enclosing (1 - missing_flux_frac) of the total flux in a Sersic profile.
@@ -435,49 +426,68 @@ class Sersic(GSObject):
         missing_flux = missing_flux_frac * self.gamma2n
         z1 = -jnp.log(missing_flux)
 
-        # TODO: replace this with jax
-        if self._n == 0.5:
-            z = z1  # Exact formula for n = 0.5
-        else:
-            z = 4.0 * (self._n + 1.0)  # Initial guess
+        def case_n_half():
+            return z1  # Exact for n = 0.5
+
+        def case_general():
+            z_init = 4.0 * (self._n + 1.0)
             twonm1 = 2.0 * self._n - 1.0
+
             z2 = (
                 z1
-                + twonm1 * jnp.log(z)
-                + twonm1 / z
-                + (twonm1 * (2.0 * self._n - 3.0)) / (2.0 * z * z)
+                + twonm1 * jnp.log(z_init)
+                + twonm1 / z_init
+                + (twonm1 * (2.0 * self._n - 3.0)) / (2.0 * z_init * z_init)
             )
 
-            # Ensure gap is not too small
-            if z2 > z1 and z2 - z1 < 0.01:
-                z2 = z1 + 0.01
-            elif z2 < z1 and z2 - z1 > -0.01:
-                z2 = z1 - 0.01
+            z2 = jax.lax.cond(
+                (z2 > z1) & ((z2 - z1) < 0.01),
+                lambda _: z1 + 0.01,
+                lambda _: z2,
+            )
+            z2 = jax.lax.cond(
+                (z2 < z1) & ((z2 - z1) > -0.01),
+                lambda _: z1 - 0.01,
+                lambda _: z2,
+            )
 
-            if z1 < 0.0:
-                z1 = self.b
+            z1_new = jax.lax.cond(z1 < 0.0, lambda _: self._b, lambda _: z1)
 
             func = SersicMissingFlux(self._n, missing_flux).__call__
-            pfunc = partial(func)
-            z = bisect_for_root(pfunc, z1, z2)
+            z_root = bisect_for_root(partial(func), z1_new, z2)
+            return z_root
 
-        return z**self._n
+        z = jax.lax.cond(
+            self._n == 0.5,
+            case_n_half,
+            case_general,
+        )
+
+        return z ** self._n
 
     def _sersic_truncated_scale(self, n, hlr, trunc):
         """Calculate the truncated scale for the Sersic profile."""
-        return hlr * calculate_truncated_scale(n, 1.0 / n, self.b, trunc / hlr)
+        return hlr * calculate_truncated_scale(n, 1.0 / n, self._b, trunc / hlr)
 
     def _build_FT(self):
-        def gammaN(p):
-            if self.trunc_factor > 0 and self._flux_fraction < 1.0:
-                z = self.trunc_factor ** (1.0 / self._n)
-                return gammainc(p, z) * gamma(p)
-            else:
-                return gamma(p)
 
-        gamma4n = gammaN(4.0 * self._n)
-        gamma6n = gammaN(6.0 * self._n)
-        gamma8n = gammaN(8.0 * self._n)
+        def compute_gammaN(p, n, trunc_factor, flux_fraction):
+            z = trunc_factor ** (1.0 / n)
+            return jax.lax.cond(
+                (trunc_factor > 0) & (flux_fraction < 1.0),
+                lambda _: gammainc(p, z) * gamma(p),
+                lambda _: gamma(p),
+            )
+
+        gamma4n = compute_gammaN(
+            4.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
+        )
+        gamma6n = compute_gammaN(
+            6.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
+        )
+        gamma8n = compute_gammaN(
+            8.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
+        )
 
         kderiv2 = -gamma4n / (4.0 * self.gamma2n) / self._flux_fraction
         kderiv4 = gamma6n / (64.0 * self.gamma2n) / self._flux_fraction
@@ -565,7 +575,7 @@ class Sersic(GSObject):
         self._kmin = kmin
         self._ksq_min = ksq_min
         self._ksq_max = ksq_max
-        self._maxk = maxk
+        self.__maxk = maxk
         self._kderiv2 = kderiv2
         self._kderiv4 = kderiv4
         self._highk_a = a
