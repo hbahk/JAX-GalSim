@@ -58,6 +58,7 @@ from .sum import Add, Sum
 from .transform import Transform, Transformation
 from .convolve import Convolve, Convolution, Deconvolution, Deconvolve
 from .deltafunction import DeltaFunction
+from .sersic import Sersic, DeVaucouleurs
 
 # WCS
 from .wcs import (
