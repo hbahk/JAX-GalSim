@@ -412,6 +412,8 @@ class Sersic(GSObject):
         hankel_norm = self._flux_fraction * self._n * self.gamma2n
         dlogk = self.gsparams.table_spacing * jnp.sqrt(jnp.sqrt(self.gsparams.kvalue_accuracy / 10.0))
 
+        # NOTE: should we use jax.lax.while_loop here? when the cost of evaluating
+        # the function is high, it might be worth it...
         logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
         k = jnp.exp(logk)
         ksq = k ** 2
@@ -450,14 +452,26 @@ class Sersic(GSObject):
         coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
         a, b = coeffs
 
+        # Check if we need to use a larger maxk
+        thres = self.gsparams.maxk_threshold
+        found_maxk = jnp.any(f0_vals < thres)
+        
+        _approx_k_at_thres = jnp.sqrt(
+            (a - b/(jnp.sqrt((a-b/(jnp.sqrt(a-b/(jnp.sqrt(a/thres))/thres))/thres)))/thres)
+            )
+        
         # Predict f0 from high-k approx
-        pred = a + b / k
-        resid = jnp.abs(f0_vals - pred) / ksq
+        f0_pred = a + b / k
+        resid = jnp.abs(f0_vals - f0_pred) / ksq
         within_tol = resid < self.gsparams.kvalue_accuracy
+        has_converged = jnp.any(within_tol)
 
         # Find the first k value where high-k approx becomes good
         ksq_max_idx = jnp.argmax(within_tol)
-        ksq_max = jnp.where(jnp.any(within_tol), ksq[ksq_max_idx], ksq[-1])
+        buffer = 5
+        ksq_max_idx_buffered = jnp.minimum(ksq_max_idx + buffer, len(k) - 1)
+        
+        ksq_max = jnp.where(has_converged, ksq[ksq_max_idx_buffered], ksq[-1])
         maxk = jnp.sqrt(ksq_max)
 
         # Store values for use elsewhere
@@ -469,6 +483,8 @@ class Sersic(GSObject):
         self.kderiv4 = kderiv4
         self.highk_a = a
         self.highk_b = b
+        self._found_maxk = found_maxk
+        self._approx_k_at_thres = _approx_k_at_thres
         
 
 @implements(_galsim.DeVaucouleurs)
