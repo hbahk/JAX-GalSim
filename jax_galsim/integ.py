@@ -1,12 +1,15 @@
 from functools import partial
 
 import galsim as _galsim
+import jax
 import jax.lax
 import jax.numpy as jnp
 from quadax import quadgk
-from quadax.utils import wrap_func, bounded_while_loop
+from quadax.utils import bounded_while_loop, wrap_func
 
 from jax_galsim.core.utils import implements
+from jax_galsim.bessel import get_j0_roots, j0, j1, y0
+
 
 
 @implements(
@@ -80,101 +83,6 @@ def int1d(
     )
 
 
-import jax
-import jax.numpy as jnp
-import equinox as eqx
-from typing import Callable, Any
-from .bessel import get_j0_roots, j0, j1, y0
-
-
-class AdaptiveOgataRuleOrderZero(eqx.Module):
-    """Adaptive Hankel quadrature rule based on Ogata's method.
-
-    Integrates: ∫₀^∞ r f(r) J_0(k r) dr
-
-    Parameters
-    ----------
-    k : float
-        Wavenumber k.
-    h0 : float
-        Initial spacing in Ogata summation.
-    max_iter : int
-        Maximum number of refinement steps (halving h).
-    N : int
-        Number of terms used in each Ogata summation (per side, so 2N+1 samples).
-    """
-    k: float
-    h0: float = 1 / 32.0
-    max_iter: int = 50
-    N: int = 256
-    
-    def __init__(self, k: float, h0: float = 1 / 32.0, max_iter: int = 50, N: int = 256):
-        self.k = k
-        self.h0 = h0
-        self.max_iter = max_iter
-        self.N = N
-        # TODO: Implement integration for non-zero order: Bessel jv (see bessel.py)
-
-    def norm(self, x: jax.Array) -> float:
-        return jnp.linalg.norm(x.flatten(), ord=jnp.inf)
-
-    def psi(self, t):
-        return t * jnp.tanh(0.5 * jnp.pi * jnp.sinh(t))
-    
-    def dpsi(self, t):
-        return 0.5 * jnp.pi * t * jnp.cosh(t) / jnp.cosh(0.5 * jnp.pi * jnp.sinh(t))**2
-
-    def _ogata_integrate(self, f: Callable, k: float, h: float, args: tuple[Any]) -> float:
-        n = jnp.arange(1, self.N + 1)
-        xi = get_j0_roots(n) / jnp.pi
-        t = xi * h
-        x = (jnp.pi / h) * self.psi(t)
-        w = y0(jnp.pi*xi) / j1(jnp.pi*xi) * jnp.pi * x * j0(x) * self.dpsi(t)
-        fx = f(x / k, *args)
-        integrand = w * fx
-        return jnp.sum(w * integrand) / k**2
-
-    @eqx.filter_jit
-    def integrate(
-        self,
-        fun: Callable,
-        relerr: float = 1e-6,
-        abserr: float = 1e-16,
-        args: tuple[Any]
-    ) -> tuple[float, float, float, float]:
-
-        f = wrap_func(fun)
-
-        k = args[0]  # assume k is passed as the first argument in `args`
-        h = self.h0
-        if h > 100 * k:
-            h = 100 * k
-
-        ans0 = self._ogata_integrate(f, k, h, args)
-        h *= 0.5
-        ans1 = self._ogata_integrate(f, k, h, args)
-        err = jnp.abs(ans1 - ans0)
-        iters = 0
-
-        def cond(state):
-            _, ans0, ans1, err, h, iters = state
-            continue_ = ((err > relerr * jnp.abs(ans1)) &
-                         ((err > abserr) | (jnp.abs(ans1) > 2 * jnp.abs(ans0))) |
-                         (ans1 == 0.0)) & (iters < self.max_iter)
-            return continue_
-
-        def body(state):
-            _, ans0, ans1, err, h, iters = state
-            h *= 0.5
-            ans0 = ans1
-            ans1 = self._ogata_integrate(f, k, h, args)
-            err = jnp.abs(ans1 - ans0)
-            return ans1, ans0, ans1, err, h, iters + 1
-
-        state = (ans1, ans0, ans1, err, h, iters)
-        ans1, *_ = bounded_while_loop(cond, body, state, max_iter + 1)
-
-        return ans1
 
 
 def _psi(t):

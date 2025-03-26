@@ -4,10 +4,10 @@ import jax.numpy as jnp
 from jax import jit, vmap
 from jax.scipy.special import gamma, gammainc
 from jax.tree_util import register_pytree_node_class
-from scipy.optimize import root_scalar
+from jax.tree_util import Partial as partial
 
 from jax_galsim.core.draw import draw_by_kValue, draw_by_xValue
-from jax_galsim.core.utils import ensure_hashable, implements
+from jax_galsim.core.utils import bisect_for_root, ensure_hashable, implements
 from jax_galsim.gsobject import GSObject
 from jax_galsim.integ import hankel_inf_zero_order, hankel_trunc_zero_order
 from jax_galsim.random import UniformDeviate
@@ -62,14 +62,11 @@ def calculate_b(n, invn, gamma2n, flux_fraction):
 
     missing_flux = (1.0 - 0.5 * flux_fraction) * gamma2n
     func = SersicMissingFlux(n, missing_flux)
+    pfunc = partial(func)
 
-    # Use SciPy's Brent method for root finding, since JAX doesn't have an equivalent built-in solver
-    result = root_scalar(func, method="brentq", bracket=[b1, b2])
+    result = bisect_for_root(pfunc, b1, b2)
 
-    if result.converged:
-        return result.root
-    else:
-        raise ValueError("Root finding did not converge")
+    return result
 
 
 def sersic_integrated_flux(n, r):
@@ -115,13 +112,10 @@ def calculate_truncated_scale(n, invn, b, trunc):
 
     b2 = b
     func = SersicTruncatedHLR(n, x)
-    result = root_scalar(func, method="brentq", bracket=[b1, b2])
+    pfunc = partial(func)
+    b_result = bisect_for_root(pfunc, b1, b2)
 
-    if result.converged:
-        b_result = result.root
-        return 1.0 / b_result**n  # r0 = re / b^n
-    else:
-        raise ValueError("Root finding did not converge")
+    return 1.0 / b_result**n  # r0 = re / b^n
 
 
 def sersic_radial_function(r, invn):
@@ -429,12 +423,8 @@ class Sersic(GSObject):
                 z1 = self.b
 
             func = SersicMissingFlux(self._n, missing_flux)
-            result = root_scalar(func, method="brentq", bracket=[z1, z2])
-
-            if result.converged:
-                z = result.root
-            else:
-                raise ValueError("Root finding did not converge")
+            pfunc = partial(func)
+            z = bisect_for_root(pfunc, z1, z2)
 
         return z**self._n
 
