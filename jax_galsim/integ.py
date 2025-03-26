@@ -11,7 +11,6 @@ from jax_galsim.core.utils import implements
 from jax_galsim.bessel import get_j0_roots, j0, j1, y0
 
 
-
 @implements(
     _galsim.integ.int1d,
     lax_description=(
@@ -83,35 +82,38 @@ def int1d(
     )
 
 
-
-
 def _psi(t):
     return t * jnp.tanh(0.5 * jnp.pi * jnp.sinh(t))
 
 
 def _dpsi(t):
-    return 0.5 * jnp.pi * t * jnp.cosh(t) / jnp.cosh(0.5 * jnp.pi * jnp.sinh(t))**2
+    return 0.5 * jnp.pi * t * jnp.cosh(t) / jnp.cosh(0.5 * jnp.pi * jnp.sinh(t)) ** 2
 
-@jax.jit
+
+@partial(jax.jit, static_argnames=("n_nodes",))
 def _hankel_integrate_zero_order(f, k, h, n_nodes, args):
     n = jnp.arange(1, n_nodes + 1)
     xi = get_j0_roots(n) / jnp.pi
     t = xi * h
     x = (jnp.pi / h) * _psi(t)
-    w = y0(jnp.pi*xi) / j1(jnp.pi*xi) * jnp.pi * x * j0(x) * _dpsi(t)
+    w = y0(jnp.pi * xi) / j1(jnp.pi * xi) * jnp.pi * x * j0(x) * _dpsi(t)
     fx = f(x / k, *args)
     integrand = w * fx
     return jnp.sum(w * integrand) / k**2
 
-@jax.jit
-def _ogata_adaptive_integrate_zero_order(fun, k, args, relerr, abserr, h0, n_nodes, max_iter):
 
-    f = wrap_func(fun)
+@partial(jax.jit, static_argnames=("max_iter", "n_nodes",))
+def _ogata_adaptive_integrate_zero_order(
+    fun, k, args, relerr, abserr, h0, n_nodes, max_iter
+):
+
+    # f = wrap_func(fun, args)
+    f = fun
 
     h = h0
-    if h > 100 * k:
-        h = 100 * k
+    h = jnp.minimum(h, 100 * k)
 
+    n_nodes = int(n_nodes)
     ans0 = _hankel_integrate_zero_order(f, k, h, n_nodes, args)
     h *= 0.5
     ans1 = _hankel_integrate_zero_order(f, k, h, n_nodes, args)
@@ -120,9 +122,9 @@ def _ogata_adaptive_integrate_zero_order(fun, k, args, relerr, abserr, h0, n_nod
 
     def cond(state):
         _, ans0, ans1, err, h, iters = state
-        continue_ = ((err > relerr * jnp.abs(ans1)) &
-                        ((err > abserr) | (jnp.abs(ans1) > 2 * jnp.abs(ans0))) |
-                        (ans1 == 0.0))
+        continue_ = (err > relerr * jnp.abs(ans1)) & (
+            (err > abserr) | (jnp.abs(ans1) > 2 * jnp.abs(ans0))
+        ) | (ans1 == 0.0)
         return continue_
 
     def body(state):
@@ -138,8 +140,11 @@ def _ogata_adaptive_integrate_zero_order(fun, k, args, relerr, abserr, h0, n_nod
 
     return ans1
 
-@jax.jit
-def hankel_inf_zero_order(func, k, args, relerr, abserr, h0=1/32.0, max_iter=50, n_nodes=256):
+
+@partial(jax.jit, static_argnames=("max_iter", "n_nodes"))
+def hankel_inf_zero_order(
+    func, k, args, relerr, abserr, h0=1 / 32.0, max_iter=50, n_nodes=256
+):
     """Integrate a function from 0 to infinity using the Ogata method.
 
     Parameters
@@ -166,12 +171,18 @@ def hankel_inf_zero_order(func, k, args, relerr, abserr, h0=1/32.0, max_iter=50,
     float
         Integral of the function.
     """
-    vec_integ = jax.vmap(lambda x: _ogata_adaptive_integrate_zero_order(func, x, args, relerr, abserr, h0, n_nodes, max_iter))
+    vec_integ = jax.vmap(
+        lambda x: _ogata_adaptive_integrate_zero_order(
+            func, x, args, relerr, abserr, h0, n_nodes, max_iter
+        )
+    )
 
     return vec_integ(k)
 
 
-def hankel_trunc_zero_order(func, k, rmax, args, relerr, abserr, h0=1/32.0, max_iter=50, n_nodes=256):
+def hankel_trunc_zero_order(
+    func, k, rmax, args, relerr, abserr, h0=1 / 32.0, max_iter=50, n_nodes=256
+):
     """Integrate a function from 0 to truncation radius using the GK method.
 
     Parameters
@@ -200,7 +211,10 @@ def hankel_trunc_zero_order(func, k, rmax, args, relerr, abserr, h0=1/32.0, max_
     float
         Integral of the function.
     """
+
     def integrand(r, *args):
         return r * func(r, *args) * j0(k * r)
 
-    return int1d(integrand, 0, rmax, rel_err=relerr, abs_err=abserr, _wrap_as_callback=True)
+    return int1d(
+        integrand, 0, rmax, rel_err=relerr, abs_err=abserr, _wrap_as_callback=True
+    )

@@ -1,11 +1,11 @@
 import galsim as _galsim
 import jax
 import jax.numpy as jnp
+from interpax import interp1d
 from jax import jit, vmap
 from jax.scipy.special import gamma, gammainc
-from jax.tree_util import register_pytree_node_class
 from jax.tree_util import Partial as partial
-from interax import interp1d
+from jax.tree_util import register_pytree_node_class
 
 from jax_galsim.core.draw import draw_by_kValue, draw_by_xValue
 from jax_galsim.core.utils import bisect_for_root, ensure_hashable, implements
@@ -159,7 +159,6 @@ class Sersic(GSObject):
         gsparams=None,
     ):
         self._n = float(n)
-        self._flux = float(flux)
         self._trunc = float(trunc)
 
         self._ft_table_fvals = None
@@ -193,6 +192,7 @@ class Sersic(GSObject):
             self._hlr = float(half_light_radius)
             if self._trunc == 0.0 or flux_untruncated:
                 self._flux_fraction = 1.0
+                self._b = calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
                 self._r0 = self._hlr / self.calculateHLRFactor()
             else:
                 if self._trunc <= jnp.sqrt(2.0) * self._hlr:
@@ -212,15 +212,15 @@ class Sersic(GSObject):
                 scale_radius=scale_radius,
             )
 
-        super().__init__(scale_radius=self._r0, flux=self._flux, gsparams=gsparams)
-
         if self._trunc > 0.0:
             self._flux_fraction = self.calculateIntegratedFlux(self._trunc)
             if flux_untruncated:
                 # Then update the flux and hlr with the correct values
-                self._flux *= self._flux_fraction
+                flux *= self._flux_fraction
         else:
             self._flux_fraction = 1.0
+
+        super().__init__(scale_radius=self._r0, flux=flux, gsparams=gsparams)
 
         # Recalculate the half-light radius with finalized _flux_fraction
         self._hlr = self._r0 * self.calculateHLRFactor()
@@ -487,8 +487,8 @@ class Sersic(GSObject):
             z = trunc_factor ** (1.0 / n)
             return jax.lax.cond(
                 (trunc_factor > 0) & (flux_fraction < 1.0),
-                lambda _: gammainc(p, z) * gamma(p),
-                lambda _: gamma(p),
+                lambda: gammainc(p, z) * gamma(p),
+                lambda: gamma(p),
             )
 
         gamma4n = compute_gammaN(
@@ -519,7 +519,7 @@ class Sersic(GSObject):
         k = jnp.exp(logk)
         ksq = k**2
 
-        f = sersic_radial_function
+        f = partial(sersic_radial_function, invn=1.0 / self._n)
 
         f_vals = jax.lax.cond(
             self.trunc_factor > 0,
