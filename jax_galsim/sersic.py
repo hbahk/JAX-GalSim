@@ -280,7 +280,7 @@ class Sersic(GSObject):
 
     @property
     def gamma2n(self):
-        return 0.5 * gamma(2.0 * self._n)
+        return gamma(2.0 * self._n)
 
     @property
     def b(self):
