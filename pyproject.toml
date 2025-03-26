@@ -21,6 +21,7 @@ dependencies = [
     "astropy >=2.0",
     "tensorflow-probability >=0.21.0",
     "quadax",
+    "interpax",
 ]
 
 [project.optional-dependencies]
