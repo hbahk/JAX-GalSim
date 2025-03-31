@@ -83,11 +83,15 @@ def int1d(
 
 
 def _psi(t):
-    return t * jnp.tanh(0.5 * jnp.pi * jnp.sinh(t))
+    return t * _psi_t(t)
+
+
+def _psi_t(t):
+    return jnp.tanh(0.5 * jnp.pi * jnp.sinh(t))
 
 
 def _dpsi(t):
-    return 0.5 * jnp.pi * t * jnp.cosh(t) / jnp.cosh(0.5 * jnp.pi * jnp.sinh(t)) ** 2
+    return 0.5 * jnp.pi * t * jnp.cosh(t) / jnp.cosh(0.5 * jnp.pi * jnp.sinh(t)) ** 2 + _psi_t(t)
 
 
 @partial(jax.jit, static_argnames=("n_nodes",))
@@ -95,11 +99,13 @@ def _hankel_integrate_zero_order(f, k, h, n_nodes, args):
     n = jnp.arange(1, n_nodes + 1)
     xi = get_j0_roots(n) / jnp.pi
     t = xi * h
-    x = (jnp.pi / h) * _psi(t)
+    # x = (jnp.pi / h) * _psi(t)
+    x = jnp.pi * _psi_t(t) * xi
     w = y0(jnp.pi * xi) / j1(jnp.pi * xi) * jnp.pi * x * j0(x) * _dpsi(t)
     fx = f(x / k, *args)
     integrand = w * fx
-    return jnp.sum(w * integrand) / k**2
+
+    return jnp.sum(integrand) / k**2
 
 
 @partial(jax.jit, static_argnames=("max_iter", "n_nodes",))
@@ -109,9 +115,11 @@ def _ogata_adaptive_integrate_zero_order(
 
     # f = wrap_func(fun, args)
     f = fun
-
     h = h0
-    h = jnp.minimum(h, 100 * k)
+
+    # Replacing C++ while loop: `while (h0 > 100*k) h0 *= 0.5;`
+    factor = jnp.maximum(0, jnp.ceil(jnp.log2(h0 / (100 * k))))
+    h = h0 * 0.5 ** factor
 
     n_nodes = int(n_nodes)
     ans0 = _hankel_integrate_zero_order(f, k, h, n_nodes, args)
@@ -122,9 +130,9 @@ def _ogata_adaptive_integrate_zero_order(
 
     def cond(state):
         _, ans0, ans1, err, h, iters = state
-        continue_ = (err > relerr * jnp.abs(ans1)) & (
+        continue_ = ((err > relerr * jnp.abs(ans1)) & (
             (err > abserr) | (jnp.abs(ans1) > 2 * jnp.abs(ans0))
-        ) | (ans1 == 0.0)
+        ) | (ans1 == 0.0)) & (iters <= max_iter)
         return continue_
 
     def body(state):
@@ -136,9 +144,11 @@ def _ogata_adaptive_integrate_zero_order(
         return ans1, ans0, ans1, err, h, iters + 1
 
     state = (ans1, ans0, ans1, err, h, iters)
-    ans1, *_ = bounded_while_loop(cond, body, state, max_iter + 1)
+    # ans1, *_ = bounded_while_loop(cond, body, state, max_iter + 1)
+    # state = bounded_while_loop(cond, body, state, max_iter + 1)
+    state = jax.lax.while_loop(cond, body, state)
 
-    return ans1
+    return state
 
 
 @partial(jax.jit, static_argnames=("max_iter", "n_nodes"))
