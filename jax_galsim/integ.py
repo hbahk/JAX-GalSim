@@ -253,9 +253,18 @@ def hankel_trunc_zero_order(
         Integral of the function.
     """
 
-    def integrand(r, *args):
-        return r * func(r, *args) * j0(k * r)
+    # TODO: This is just a temporary replacement to match jax output in building FT values of Sersic
+    vec_integ = jax.vmap(
+        lambda x: _ogata_adaptive_integrate_zero_order(
+            func, x, args, relerr, abserr, h0, n_nodes, max_iter
+        )
+    )
+    k = jnp.atleast_1d(k)
+    return vec_integ(k)
 
-    return int1d(
-        integrand, 0, rmax, rel_err=relerr, abs_err=abserr, _wrap_as_callback=True
-    )  # TODO: this should be updated with the ogata sampling...
+    # def integrand(r, *args):
+    #     return r * func(r, *args) * j0(k * r)
+
+    # return int1d(
+    #     integrand, 0, rmax, rel_err=relerr, abs_err=abserr, _wrap_as_callback=True
+    # )  # TODO: this should be updated with the ogata sampling...

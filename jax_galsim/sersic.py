@@ -177,29 +177,48 @@ def _build_FT(
 
     f = partial(sersic_radial_function, invn=1.0 / n)
 
-    if trunc_factor > 0:
-        f_vals = hankel_trunc_zero_order(
+    # if trunc_factor > 0:
+    #     f_vals = hankel_trunc_zero_order(
+    #         f,
+    #         k,
+    #         trunc_factor,
+    #         (),
+    #         relerr=integration_relerr,
+    #         abserr=integration_abserr * hankel_norm,
+    #     )
+    # else:
+    #     f_vals = hankel_inf_zero_order(
+    #         f,
+    #         k,
+    #         (),
+    #         relerr=integration_relerr,
+    #         abserr=integration_abserr * hankel_norm,
+    #     )
+
+    f_vals = jax.lax.cond(
+        trunc_factor > 0,
+        lambda: hankel_trunc_zero_order(
             f,
             k,
             trunc_factor,
             (),
             relerr=integration_relerr,
             abserr=integration_abserr * hankel_norm,
-        )
-    else:
-        f_vals = hankel_inf_zero_order(
+        ),
+        lambda: hankel_inf_zero_order(
             f,
             k,
             (),
             relerr=integration_relerr,
             abserr=integration_abserr * hankel_norm,
-        )
+        ),
+    )
 
     f_vals /= hankel_norm
     f0_vals = f_vals * ksq
 
     # Fit a/k^2 + b/k^3 to last `n_fit` values
-    n_fit = 10
+    n_fit = 100
     tail_idx = -n_fit
     inv_k = 1.0 / k[tail_idx:]
     f0 = f0_vals[tail_idx:]
@@ -310,6 +329,86 @@ def _calculate_missing_flux_radius(n, gamma2n, b, missing_flux_frac):
     return z**n
 
 
+def parse_radius_options(
+    n, gamma2n, trunc, flux_untruncated, half_light_radius, scale_radius, flux
+):
+    sqrt2 = jnp.sqrt(2.0)
+
+    # Check for mutually exclusive condition
+    if half_light_radius is not None and scale_radius is not None:
+        raise _galsim.GalSimIncompatibleValuesError(
+            "Only one of scale_radius or half_light_radius may be specified for Sersic",
+            half_light_radius=half_light_radius,
+            scale_radius=scale_radius,
+        )
+
+    if half_light_radius is None and scale_radius is None:
+        raise _galsim.GalSimIncompatibleValuesError(
+            "Either scale_radius or half_light_radius must be specified for Sersic",
+            half_light_radius=half_light_radius,
+            scale_radius=scale_radius,
+        )
+
+    use_hlr = half_light_radius is not None
+    hlr = half_light_radius if use_hlr else None
+
+    if use_hlr:
+
+        def hlr_branch():
+            def untrunc_branch():
+                b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+                r0 = hlr / b**n
+                return r0, flux, b
+
+            def trunc_branch():
+                too_small = trunc <= sqrt2 * hlr
+
+                def raise_trunc_err():
+                    return jnp.nan, jnp.nan, jnp.nan  # to raise an error in case of invalid truncation value
+
+                def good_trunc():
+                    b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+                    r0 = hlr * calculate_truncated_scale(n, 1.0 / n, b, trunc / hlr)
+                    return r0, flux, b
+
+                return jax.lax.cond(too_small, raise_trunc_err, good_trunc)
+
+            is_untrunc = (trunc == 0.0) or flux_untruncated
+            return jax.lax.cond(is_untrunc, untrunc_branch, trunc_branch)
+
+        r0, flux, b = hlr_branch()
+
+    else:  # use scale_radius
+        r0 = scale_radius
+        b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+
+    # Now compute flux_fraction and potentially update flux
+    def trunc_branch_flux():
+        flux_fraction = sersic_integrated_flux(n, trunc / r0)
+
+        def update_flux():
+            return flux * flux_fraction
+
+        def keep_flux():
+            return flux
+
+        flux_new = jax.lax.cond(flux_untruncated, update_flux, keep_flux)
+        return flux_fraction, flux_new
+
+    def untrunc_branch_flux():
+        return 1.0, flux
+
+    flux_fraction, flux = jax.lax.cond(
+        trunc > 0.0, trunc_branch_flux, untrunc_branch_flux
+    )
+
+    # Final half-light radius
+    b = calculate_b(n, 1.0 / n, gamma2n, flux_fraction)
+    hlr = r0 * b**n
+
+    return r0, hlr, flux, flux_fraction, b
+
+
 @implements(_galsim.Sersic)
 @register_pytree_node_class
 class Sersic(GSObject):
@@ -321,11 +420,9 @@ class Sersic(GSObject):
     _is_analytic_x = True
     _is_analytic_k = True
 
-    _minimum_n = 0.3  # Lower bounds has hard limit at ~0.29
-    _maximum_n = 6.2  # Upper bounds is just where we have tested that code works well.
+    # _minimum_n = 0.3  # Lower bounds has hard limit at ~0.29
+    # _maximum_n = 6.2  # Upper bounds is just where we have tested that code works well.
 
-    # The conversion from hlr to scale radius is complicated for Sersic, especially since we
-    # allow it to be truncated.  So we do these calculations in the C++-layer constructor.
     def __init__(
         self,
         n,
@@ -341,67 +438,114 @@ class Sersic(GSObject):
         _gsparams = GSParams.check(gsparams)
         gamma2n = gamma(2.0 * n)
 
-        if n < Sersic._minimum_n:
-            raise _galsim.GalSimRangeError(
-                "Requested Sersic index is too small",
-                n,
-                Sersic._minimum_n,
-                Sersic._maximum_n,
-            )
-        if n > Sersic._maximum_n:
-            raise _galsim.GalSimRangeError(
-                "Requested Sersic index is too large",
-                n,
-                Sersic._minimum_n,
-                Sersic._maximum_n,
-            )
+        # if n < Sersic._minimum_n:
+        #     raise _galsim.GalSimRangeError(
+        #         "Requested Sersic index is too small",
+        #         n,
+        #         Sersic._minimum_n,
+        #         Sersic._maximum_n,
+        #     )
+        # if n > Sersic._maximum_n:
+        #     raise _galsim.GalSimRangeError(
+        #         "Requested Sersic index is too large",
+        #         n,
+        #         Sersic._minimum_n,
+        #         Sersic._maximum_n,
+        #     )
 
-        if trunc < 0:
-            raise _galsim.GalSimRangeError("Sersic trunc must be > 0", trunc, 0.0)
+        # I think it's better to check outside the vmap
+        # def raise_low():
+        #     jax.debug.print(
+        #         "n = {n} is too small, raising to minimum {nmin}",
+        #         n=n,
+        #         nmin=Sersic._minimum_n,
+        #     )
+        #     return Sersic._minimum_n
+
+        # def ok_low():
+        #     return n
+
+        # def raise_high():
+        #     jax.debug.print(
+        #         "n = {n} is too large, lowering to maximum {nmax}",
+        #         n=n,
+        #         nmax=Sersic._maximum_n,
+        #     )
+        #     return Sersic._maximum_n
+
+        # def ok_high():
+        #     return n
+
+        # # First check lower bound
+        # n = jax.lax.cond(n < Sersic._minimum_n, raise_low, ok_low)
+
+        # # Then check upper bound
+        # n = jax.lax.cond(n > Sersic._maximum_n, raise_high, ok_high)
+
+        # if trunc < 0:
+        #     raise _galsim.GalSimRangeError("Sersic trunc must be > 0", trunc, 0.0)
+
+        def raise_trunc_invalid():
+            return jnp.nan  # to raise an error in case of invalid truncation value
+
+        def ok_trunc():
+            return trunc
+
+        trunc = jax.lax.cond(trunc < 0, raise_trunc_invalid, ok_trunc)
 
         # Parse the radius options
-        if half_light_radius is not None:
-            if scale_radius is not None:
-                raise _galsim.GalSimIncompatibleValuesError(
-                    "Only one of scale_radius or half_light_radius may be specified for Spergel",
-                    half_light_radius=half_light_radius,
-                    scale_radius=scale_radius,
-                )
-            hlr = float(half_light_radius)
-            if trunc == 0.0 or flux_untruncated:
-                flux_fraction = 1.0
-                b = calculate_b(n, 1.0 / n, gamma2n, flux_fraction)
-                r0 = hlr / b**n
-            else:
-                if trunc <= jnp.sqrt(2.0) * hlr:
-                    raise _galsim.GalSimRangeError(
-                        "Sersic trunc must be > sqrt(2) * half_light_radius",
-                        trunc,
-                        jnp.sqrt(2.0) * hlr,
-                    )
-                b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
-                r0 = hlr * calculate_truncated_scale(n, 1.0 / n, b, trunc / hlr)
+        r0, hlr, flux, flux_fraction, b = parse_radius_options(
+            n,
+            gamma2n,
+            trunc,
+            flux_untruncated,
+            half_light_radius,
+            scale_radius,
+            flux,
+        )
 
-        elif scale_radius is not None:
-            r0 = scale_radius
-        else:
-            raise _galsim.GalSimIncompatibleValuesError(
-                "Either scale_radius or half_light_radius must be specified for Spergel",
-                half_light_radius=half_light_radius,
-                scale_radius=scale_radius,
-            )
+        # if half_light_radius is not None:
+        #     if scale_radius is not None:
+        #         raise _galsim.GalSimIncompatibleValuesError(
+        #             "Only one of scale_radius or half_light_radius may be specified for Spergel",
+        #             half_light_radius=half_light_radius,
+        #             scale_radius=scale_radius,
+        #         )
+        #     hlr = float(half_light_radius)
+        #     if trunc == 0.0 or flux_untruncated:
+        #         flux_fraction = 1.0
+        #         b = calculate_b(n, 1.0 / n, gamma2n, flux_fraction)
+        #         r0 = hlr / b**n
+        #     else:
+        #         if trunc <= jnp.sqrt(2.0) * hlr:
+        #             raise _galsim.GalSimRangeError(
+        #                 "Sersic trunc must be > sqrt(2) * half_light_radius",
+        #                 trunc,
+        #                 jnp.sqrt(2.0) * hlr,
+        #             )
+        #         b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+        #         r0 = hlr * calculate_truncated_scale(n, 1.0 / n, b, trunc / hlr)
 
-        if trunc > 0.0:
-            flux_fraction = sersic_integrated_flux(n, trunc / r0)
-            if flux_untruncated:
-                # Then update the flux and hlr with the correct values
-                flux *= flux_fraction
-        else:
-            flux_fraction = 1.0
+        # elif scale_radius is not None:
+        #     r0 = scale_radius
+        # else:
+        #     raise _galsim.GalSimIncompatibleValuesError(
+        #         "Either scale_radius or half_light_radius must be specified for Spergel",
+        #         half_light_radius=half_light_radius,
+        #         scale_radius=scale_radius,
+        #     )
 
-        # Recalculate the half-light radius with finalized _flux_fraction
-        b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
-        hlr = r0 * b**n
+        # if trunc > 0.0:
+        #     flux_fraction = sersic_integrated_flux(n, trunc / r0)
+        #     if flux_untruncated:
+        #         # Then update the flux and hlr with the correct values
+        #         flux *= flux_fraction
+        # else:
+        #     flux_fraction = 1.0
+
+        # # Recalculate the half-light radius with finalized _flux_fraction
+        # b = calculate_b(n, 1.0 / n, gamma2n, flux_fraction)
+        # hlr = r0 * b**n
 
         # Initialize the FT lookup table
         trunc_factor = trunc / r0
@@ -420,11 +564,15 @@ class Sersic(GSObject):
 
         # Initialize the stepk values
         R = _calculate_missing_flux_radius(n, gamma2n, b, _gsparams.folding_threshold)
-        if flux_fraction < 1.0 and trunc_factor < R:
-            R = trunc_factor
+        R = jax.lax.cond(
+            flux_fraction < 1.0 and trunc_factor < R, lambda: trunc_factor, lambda: R
+        )
+        # if flux_fraction < 1.0 and trunc_factor < R:
+        #     R = trunc_factor
+
         # Make sure it is at least 5 hlr
         R = jnp.max(jnp.array([R, _gsparams.stepk_minimum_hlr]))
-        stepk = jnp.pi / R
+        stepk = jnp.pi / R / r0
 
         super().__init__(
             n=n,
@@ -436,7 +584,7 @@ class Sersic(GSObject):
             # stepk=stepk,
             # **ft_result,
         )
-        
+
         self._ft = ft_result
         self.__stepk = stepk
         self.__flux_fraction = flux_fraction
@@ -610,7 +758,7 @@ class Sersic(GSObject):
             / ksq,
         )
 
-        return _kvalue
+        return _kvalue * self._flux
 
     def _shoot(self, photons, rng):
         raise NotImplementedError(
