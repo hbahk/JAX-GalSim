@@ -154,7 +154,7 @@ def _ogata_adaptive_integrate_zero_order(
 
     state = (ans1, ans0, ans1, err, h, iters)
     state = jax.lax.while_loop(cond, body, state)
-    integral = state[0][0]
+    integral = state[0]
 
     return integral
 
@@ -214,8 +214,11 @@ def hankel_inf_zero_order(
         )
     )
     # TODO: Consider k=0 case
-
+    k = jnp.atleast_1d(k)
     return vec_integ(k)
+    # return _ogata_adaptive_integrate_zero_order(
+    #         func, k, args, relerr, abserr, h0, n_nodes, max_iter
+    #     )
 
 
 def hankel_trunc_zero_order(

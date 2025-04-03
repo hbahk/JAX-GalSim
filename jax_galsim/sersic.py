@@ -158,9 +158,8 @@ class Sersic(GSObject):
         flux_untruncated=False,
         gsparams=None,
     ):
-        self._n = float(n)
-        self._trunc = float(trunc)
-
+        self._n = n
+        self._trunc = trunc
         self._ft_table_fvals = None
 
         if self._n < Sersic._minimum_n:
@@ -192,7 +191,9 @@ class Sersic(GSObject):
             self._hlr = float(half_light_radius)
             if self._trunc == 0.0 or flux_untruncated:
                 self._flux_fraction = 1.0
-                self._b = calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
+                self._b = calculate_b(
+                    self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction
+                )
                 self._r0 = self._hlr / self.calculateHLRFactor()
             else:
                 if self._trunc <= jnp.sqrt(2.0) * self._hlr:
@@ -220,7 +221,7 @@ class Sersic(GSObject):
         else:
             self._flux_fraction = 1.0
 
-        super().__init__(scale_radius=self._r0, flux=flux, gsparams=gsparams)
+        super().__init__(n=self._n, scale_radius=self._r0, flux=flux, gsparams=gsparams)
 
         # Recalculate the half-light radius with finalized _flux_fraction
         self._hlr = self._r0 * self.calculateHLRFactor()
@@ -424,7 +425,6 @@ class Sersic(GSObject):
             gsparams=self.gsparams,
         )
 
-    @jax.jit
     def _calculate_missing_flux_radius(self, missing_flux_frac):
         """
         Find the radius enclosing (1 - missing_flux_frac) of the total flux in a Sersic profile.
@@ -454,16 +454,16 @@ class Sersic(GSObject):
 
             z2 = jax.lax.cond(
                 (z2 > z1) & ((z2 - z1) < 0.01),
-                lambda _: z1 + 0.01,
-                lambda _: z2,
+                lambda: z1 + 0.01,
+                lambda: z2,
             )
             z2 = jax.lax.cond(
                 (z2 < z1) & ((z2 - z1) > -0.01),
-                lambda _: z1 - 0.01,
-                lambda _: z2,
+                lambda: z1 - 0.01,
+                lambda: z2,
             )
 
-            z1_new = jax.lax.cond(z1 < 0.0, lambda _: self._b, lambda _: z1)
+            z1_new = jax.lax.cond(z1 < 0.0, lambda: self._b, lambda: z1)
 
             func = SersicMissingFlux(self._n, missing_flux).__call__
             z_root = bisect_for_root(partial(func), z1_new, z2)
@@ -482,7 +482,6 @@ class Sersic(GSObject):
         return hlr * calculate_truncated_scale(n, 1.0 / n, self._b, trunc / hlr)
 
     def _build_FT(self):
-
         def compute_gammaN(p, n, trunc_factor, flux_fraction):
             z = trunc_factor ** (1.0 / n)
             return jax.lax.cond(
@@ -519,27 +518,31 @@ class Sersic(GSObject):
         k = jnp.exp(logk)
         ksq = k**2
 
+        # NOTE: should we use jax.lax.while_loop here? when the cost of evaluating
+        # the function is high, it might be worth it...
+        logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
+        k = jnp.exp(logk)
+        ksq = k**2
+
         f = partial(sersic_radial_function, invn=1.0 / self._n)
 
-        f_vals = jax.lax.cond(
-            self.trunc_factor > 0,
-            lambda x: hankel_trunc_zero_order(
+        if self.trunc_factor > 0:
+            f_vals = hankel_trunc_zero_order(
                 f,
-                x,
+                k,
                 self.trunc_factor,
-                1.0 / self._n,
+                (),
                 relerr=self.gsparams.integration_relerr,
                 abserr=self.gsparams.integration_abserr * hankel_norm,
-            ),
-            lambda x: hankel_inf_zero_order(
+            )
+        else:
+            f_vals = hankel_inf_zero_order(
                 f,
-                x,
-                1.0 / self._n,
+                k,
+                (),
                 relerr=self.gsparams.integration_relerr,
                 abserr=self.gsparams.integration_abserr * hankel_norm,
-            ),
-            k,
-        )
+            )
 
         f_vals /= hankel_norm
         f0_vals = f_vals * ksq
