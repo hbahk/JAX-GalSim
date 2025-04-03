@@ -10,6 +10,7 @@ from jax.tree_util import register_pytree_node_class
 from jax_galsim.core.draw import draw_by_kValue, draw_by_xValue
 from jax_galsim.core.utils import bisect_for_root, ensure_hashable, implements
 from jax_galsim.gsobject import GSObject
+from jax_galsim.gsparams import GSParams
 from jax_galsim.integ import hankel_inf_zero_order, hankel_trunc_zero_order
 from jax_galsim.random import UniformDeviate
 from jax_galsim.utilities import lazy_property
@@ -132,6 +133,183 @@ def sersic_radial_function(r, invn):
     return jnp.exp(-jnp.power(r, invn))
 
 
+# @partial(jit, static_argnames=("n_ksteps",))
+def _build_FT(
+    n,
+    trunc_factor,
+    flux_fraction,
+    gamma2n,
+    kvalue_accuracy,
+    table_spacing,
+    integration_relerr,
+    integration_abserr,
+    maxk_threshold,
+    n_ksteps=1000,
+):
+
+    def compute_gammaN(p):
+        z = trunc_factor ** (1.0 / n)
+        return jax.lax.cond(
+            (trunc_factor > 0) & (flux_fraction < 1.0),
+            lambda: gammainc(p, z) * gamma(p),
+            lambda: gamma(p),
+        )
+
+    gamma4n = compute_gammaN(4.0 * n)
+    gamma6n = compute_gammaN(6.0 * n)
+    gamma8n = compute_gammaN(8.0 * n)
+
+    kderiv2 = -gamma4n / (4.0 * gamma2n) / flux_fraction
+    kderiv4 = gamma6n / (64.0 * gamma2n) / flux_fraction
+    kderiv6 = gamma8n / (2304.0 * gamma2n) / flux_fraction
+
+    kmin = (kvalue_accuracy / kderiv6) ** (1.0 / 6.0)
+    ksq_min = kmin * kmin
+
+    hankel_norm = flux_fraction * n * gamma2n
+    dlogk_desired = table_spacing * jnp.sqrt(jnp.sqrt(kvalue_accuracy / 10.0))
+
+    # logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
+    logk = jnp.linspace(jnp.log(kmin) - 0.001, jnp.log(500.0), n_ksteps)
+    dlogk = (jnp.log(500.0) - (jnp.log(kmin) - 0.001)) / n_ksteps
+    k = jnp.exp(logk)
+    ksq = k**2
+
+    f = partial(sersic_radial_function, invn=1.0 / n)
+
+    if trunc_factor > 0:
+        f_vals = hankel_trunc_zero_order(
+            f,
+            k,
+            trunc_factor,
+            (),
+            relerr=integration_relerr,
+            abserr=integration_abserr * hankel_norm,
+        )
+    else:
+        f_vals = hankel_inf_zero_order(
+            f,
+            k,
+            (),
+            relerr=integration_relerr,
+            abserr=integration_abserr * hankel_norm,
+        )
+
+    f_vals /= hankel_norm
+    f0_vals = f_vals * ksq
+
+    # Fit a/k^2 + b/k^3 to last `n_fit` values
+    n_fit = 10
+    tail_idx = -n_fit
+    inv_k = 1.0 / k[tail_idx:]
+    f0 = f0_vals[tail_idx:]
+
+    A = jnp.stack([jnp.ones_like(inv_k), inv_k], axis=1)
+    coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
+    a, b = coeffs
+
+    # Check if we need to use a larger maxk
+    thres = maxk_threshold
+    found_maxk = jnp.any(f0_vals < thres)
+
+    _approx_k_at_thres = jnp.sqrt(
+        (
+            a
+            - b
+            / jnp.sqrt(
+                (a - b / jnp.sqrt((a - b / jnp.sqrt(a / thres)) / thres)) / thres
+            )
+        )
+        / thres
+    )
+
+    # Predict f0 from high-k approx
+    f0_pred = a + b / k
+    resid = jnp.abs(f0_vals - f0_pred) / ksq
+    within_tol = resid < kvalue_accuracy
+    has_converged = jnp.any(within_tol)
+
+    # Find the first k value where high-k approx becomes good
+    ksq_max_idx = jnp.argmax(within_tol)
+    buffer = 5
+    ksq_max_idx_buffered = jnp.minimum(ksq_max_idx + buffer, len(k) - 1)
+
+    ksq_max = jnp.where(has_converged, ksq[ksq_max_idx_buffered], ksq[-1])
+    maxk = jnp.sqrt(ksq_max)
+
+    return {
+        "kmin": kmin,
+        "ksq_min": ksq_min,
+        "ksq_max": ksq_max,
+        "maxk": maxk,
+        "kderiv2": kderiv2,
+        "kderiv4": kderiv4,
+        "highk_a": a,
+        "highk_b": b,
+        "found_maxk": found_maxk,
+        "_approx_k_at_thres": _approx_k_at_thres,
+        "ft_table_logk": logk,
+        "ft_table_fvals": f_vals,
+        "is_dlogk_good": dlogk < dlogk_desired,
+        "dlogk": dlogk,
+        "dlogk_desired": dlogk_desired,
+    }
+
+
+@jit
+def _calculate_missing_flux_radius(n, gamma2n, b, missing_flux_frac):
+    """
+    Find the radius enclosing (1 - missing_flux_frac) of the total flux in a Sersic profile.
+
+    Parameters:
+    missing_flux_frac (float): Fraction of flux that is missing (not enclosed)
+
+    Returns:
+    float: The radius R that encloses (1 - missing_flux_frac) of the total flux
+    """
+    missing_flux = missing_flux_frac * gamma2n
+    z1 = -jnp.log(missing_flux)
+
+    def case_n_half():
+        return z1  # Exact for n = 0.5
+
+    def case_general():
+        z_init = 4.0 * (n + 1.0)
+        twonm1 = 2.0 * n - 1.0
+
+        z2 = (
+            z1
+            + twonm1 * jnp.log(z_init)
+            + twonm1 / z_init
+            + (twonm1 * (2.0 * n - 3.0)) / (2.0 * z_init * z_init)
+        )
+
+        z2 = jax.lax.cond(
+            (z2 > z1) & ((z2 - z1) < 0.01),
+            lambda: z1 + 0.01,
+            lambda: z2,
+        )
+        z2 = jax.lax.cond(
+            (z2 < z1) & ((z2 - z1) > -0.01),
+            lambda: z1 - 0.01,
+            lambda: z2,
+        )
+
+        z1_new = jax.lax.cond(z1 < 0.0, lambda: b, lambda: z1)
+
+        func = SersicMissingFlux(n, missing_flux).__call__
+        z_root = bisect_for_root(partial(func), z1_new, z2)
+        return z_root
+
+    z = jax.lax.cond(
+        n == 0.5,
+        case_n_half,
+        case_general,
+    )
+
+    return z**n
+
+
 @implements(_galsim.Sersic)
 @register_pytree_node_class
 class Sersic(GSObject):
@@ -157,28 +335,29 @@ class Sersic(GSObject):
         trunc=0.0,
         flux_untruncated=False,
         gsparams=None,
+        n_ksteps=1000,
     ):
-        self._n = n
-        self._trunc = trunc
-        self._ft_table_fvals = None
 
-        if self._n < Sersic._minimum_n:
+        _gsparams = GSParams.check(gsparams)
+        gamma2n = gamma(2.0 * n)
+
+        if n < Sersic._minimum_n:
             raise _galsim.GalSimRangeError(
                 "Requested Sersic index is too small",
-                self._n,
+                n,
                 Sersic._minimum_n,
                 Sersic._maximum_n,
             )
-        if self._n > Sersic._maximum_n:
+        if n > Sersic._maximum_n:
             raise _galsim.GalSimRangeError(
                 "Requested Sersic index is too large",
-                self._n,
+                n,
                 Sersic._minimum_n,
                 Sersic._maximum_n,
             )
 
-        if self._trunc < 0:
-            raise _galsim.GalSimRangeError("Sersic trunc must be > 0", self._trunc, 0.0)
+        if trunc < 0:
+            raise _galsim.GalSimRangeError("Sersic trunc must be > 0", trunc, 0.0)
 
         # Parse the radius options
         if half_light_radius is not None:
@@ -188,24 +367,23 @@ class Sersic(GSObject):
                     half_light_radius=half_light_radius,
                     scale_radius=scale_radius,
                 )
-            self._hlr = float(half_light_radius)
-            if self._trunc == 0.0 or flux_untruncated:
-                self._flux_fraction = 1.0
-                self._b = calculate_b(
-                    self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction
-                )
-                self._r0 = self._hlr / self.calculateHLRFactor()
+            hlr = float(half_light_radius)
+            if trunc == 0.0 or flux_untruncated:
+                flux_fraction = 1.0
+                b = calculate_b(n, 1.0 / n, gamma2n, flux_fraction)
+                r0 = hlr / b**n
             else:
-                if self._trunc <= jnp.sqrt(2.0) * self._hlr:
+                if trunc <= jnp.sqrt(2.0) * hlr:
                     raise _galsim.GalSimRangeError(
                         "Sersic trunc must be > sqrt(2) * half_light_radius",
-                        self._trunc,
-                        jnp.sqrt(2.0) * self._hlr,
+                        trunc,
+                        jnp.sqrt(2.0) * hlr,
                     )
-                self._r0 = self._sersic_truncated_scale(self._n, self._hlr, self._trunc)
+                b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+                r0 = hlr * calculate_truncated_scale(n, 1.0 / n, b, trunc / hlr)
 
         elif scale_radius is not None:
-            self._r0 = float(scale_radius)
+            r0 = scale_radius
         else:
             raise _galsim.GalSimIncompatibleValuesError(
                 "Either scale_radius or half_light_radius must be specified for Spergel",
@@ -213,49 +391,63 @@ class Sersic(GSObject):
                 scale_radius=scale_radius,
             )
 
-        if self._trunc > 0.0:
-            self._flux_fraction = self.calculateIntegratedFlux(self._trunc)
+        if trunc > 0.0:
+            flux_fraction = sersic_integrated_flux(n, trunc / r0)
             if flux_untruncated:
                 # Then update the flux and hlr with the correct values
-                flux *= self._flux_fraction
+                flux *= flux_fraction
         else:
-            self._flux_fraction = 1.0
-
-        super().__init__(n=self._n, scale_radius=self._r0, flux=flux, gsparams=gsparams)
+            flux_fraction = 1.0
 
         # Recalculate the half-light radius with finalized _flux_fraction
-        self._hlr = self._r0 * self.calculateHLRFactor()
-
-        # Calculate the parameter b
-        self._b = calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
+        b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
+        hlr = r0 * b**n
 
         # Initialize the FT lookup table
-        self._build_FT()
+        trunc_factor = trunc / r0
+        ft_result = _build_FT(
+            n,
+            trunc_factor,
+            flux_fraction,
+            gamma2n,
+            _gsparams.kvalue_accuracy,
+            _gsparams.table_spacing,
+            _gsparams.integration_relerr,
+            _gsparams.integration_abserr,
+            _gsparams.maxk_threshold,
+            n_ksteps,
+        )
 
         # Initialize the stepk values
-        R = self._calculate_missing_flux_radius(self.gsparams.folding_threshold)
-        if self._flux_fraction < 1.0 and self.trunc_factor < R:
-            R = self.trunc_factor
+        R = _calculate_missing_flux_radius(n, gamma2n, b, _gsparams.folding_threshold)
+        if flux_fraction < 1.0 and trunc_factor < R:
+            R = trunc_factor
         # Make sure it is at least 5 hlr
-        R = jnp.max(jnp.array([R, self.gsparams.stepk_minimum_hlr]))
-        self.__stepk = jnp.pi / R
+        R = jnp.max(jnp.array([R, _gsparams.stepk_minimum_hlr]))
+        stepk = jnp.pi / R
+
+        super().__init__(
+            n=n,
+            scale_radius=r0,
+            flux=flux,
+            trunc=trunc,
+            gsparams=gsparams,
+            # flux_fraction=flux_fraction,
+            # stepk=stepk,
+            # **ft_result,
+        )
+        
+        self._ft = ft_result
+        self.__stepk = stepk
+        self.__flux_fraction = flux_fraction
 
     def calculateIntegratedFlux(self, r):
         """Return the fraction of the total flux enclosed within a given radius, r"""
         return sersic_integrated_flux(self._n, float(r) / self._r0)
 
-    # return _galsim.SersicIntegratedFlux(self._n, float(r)/self._r0)
-
     def calculateHLRFactor(self):
         """Calculate the half-light-radius in units of the scale radius."""
         return self._b**self._n
-
-    # @lazy_property
-    # def _sbp(self):
-    #     with convert_cpp_errors():
-    #         return _galsim.SBSersic(
-    #             self._n, self._r0, self._flux, self._trunc, self.gsparams._gsp
-    #         )
 
     @property
     def n(self):
@@ -263,14 +455,26 @@ class Sersic(GSObject):
         return self._n
 
     @property
+    def _n(self):
+        return self.params["n"]
+
+    @property
     def scale_radius(self):
         """The scale radius."""
         return self._r0
 
     @property
+    def _r0(self):
+        return self.params["scale_radius"]
+
+    @property
     def trunc(self):
         """The truncation radius (if any)."""
         return self._trunc
+
+    @property
+    def _trunc(self):
+        return self.params["trunc"]
 
     @property
     def trunc_factor(self):
@@ -280,11 +484,20 @@ class Sersic(GSObject):
     @property
     def half_light_radius(self):
         """The half-light radius."""
-        return self._hlr
+        return self._r0 * self.calculateHLRFactor()
 
     @property
     def gamma2n(self):
         return gamma(2.0 * self._n)
+
+    @property
+    def _flux_fraction(self):
+        # return self.params["flux_fraction"]
+        return self.__flux_fraction
+
+    @property
+    def _b(self):
+        return calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
 
     def __eq__(self, other):
         return self is other or (
@@ -345,7 +558,7 @@ class Sersic(GSObject):
 
     @property
     def _maxk(self):
-        return self.__maxk
+        return self._ft["maxk"]
 
     @property
     def _stepk(self):
@@ -364,11 +577,11 @@ class Sersic(GSObject):
 
     @property
     def _max_sb(self):
-        _inv_r0_sq = 1.0 / (self._r0 * self._r0)
+        _inv_r0_sq = 1.0 / self._r0**2
         return _inv_r0_sq * self._shootnorm
 
     def _xValue(self, pos):
-        rsq = (pos.x**2 + pos.y**2) / (self._r0 * self._r0)
+        rsq = (pos.x**2 + pos.y**2) / self._r0**2
         _truncated = (self.trunc_factor > 0) and (rsq > self.trunc**2)
         _xvalue = (
             jnp.select(
@@ -381,21 +594,19 @@ class Sersic(GSObject):
         return _xvalue
 
     def _kValue(self, kpos):
-        ksq = (kpos.x**2 + kpos.y**2) * self._r0 * self._r0
-
-        jax.lax.cond(
-            self._ft_table_fvals is None,
-            lambda: self._build_FT(),
-            lambda: None,
-        )
+        ksq = (kpos.x**2 + kpos.y**2) * self._r0**2
 
         _kvalue = jnp.select(
-            [ksq < self._ksq_min, ksq >= self._ksq_max],
+            [ksq < self._ft["ksq_min"], ksq >= self._ft["ksq_max"]],
             [
-                1.0 + ksq * (self._kderiv2 + ksq * self._kderiv4),
-                (self._highk_a + self._highk_b / jnp.sqrt(ksq)) / ksq,
+                1.0 + ksq * (self._ft["kderiv2"] + ksq * self._ft["kderiv4"]),
+                (self._ft["highk_a"] + self._ft["highk_b"] / jnp.sqrt(ksq)) / ksq,
             ],
-            interp1d(0.5 * jnp.log(ksq), self._ft_table_logk, self._ft_table_fvals)
+            interp1d(
+                0.5 * jnp.log(ksq),
+                self._ft["ft_table_logk"],
+                self._ft["ft_table_fvals"],
+            )
             / ksq,
         )
 
@@ -425,182 +636,189 @@ class Sersic(GSObject):
             gsparams=self.gsparams,
         )
 
-    def _calculate_missing_flux_radius(self, missing_flux_frac):
-        """
-        Find the radius enclosing (1 - missing_flux_frac) of the total flux in a Sersic profile.
+    # def _calculate_missing_flux_radius(self, missing_flux_frac):
+    #     """
+    #     Find the radius enclosing (1 - missing_flux_frac) of the total flux in a Sersic profile.
 
-        Parameters:
-        missing_flux_frac (float): Fraction of flux that is missing (not enclosed)
+    #     Parameters:
+    #     missing_flux_frac (float): Fraction of flux that is missing (not enclosed)
 
-        Returns:
-        float: The radius R that encloses (1 - missing_flux_frac) of the total flux
-        """
-        missing_flux = missing_flux_frac * self.gamma2n
-        z1 = -jnp.log(missing_flux)
+    #     Returns:
+    #     float: The radius R that encloses (1 - missing_flux_frac) of the total flux
+    #     """
+    #     missing_flux = missing_flux_frac * self.gamma2n
+    #     z1 = -jnp.log(missing_flux)
 
-        def case_n_half():
-            return z1  # Exact for n = 0.5
+    #     def case_n_half():
+    #         return z1  # Exact for n = 0.5
 
-        def case_general():
-            z_init = 4.0 * (self._n + 1.0)
-            twonm1 = 2.0 * self._n - 1.0
+    #     def case_general():
+    #         z_init = 4.0 * (self._n + 1.0)
+    #         twonm1 = 2.0 * self._n - 1.0
 
-            z2 = (
-                z1
-                + twonm1 * jnp.log(z_init)
-                + twonm1 / z_init
-                + (twonm1 * (2.0 * self._n - 3.0)) / (2.0 * z_init * z_init)
-            )
+    #         z2 = (
+    #             z1
+    #             + twonm1 * jnp.log(z_init)
+    #             + twonm1 / z_init
+    #             + (twonm1 * (2.0 * self._n - 3.0)) / (2.0 * z_init * z_init)
+    #         )
 
-            z2 = jax.lax.cond(
-                (z2 > z1) & ((z2 - z1) < 0.01),
-                lambda: z1 + 0.01,
-                lambda: z2,
-            )
-            z2 = jax.lax.cond(
-                (z2 < z1) & ((z2 - z1) > -0.01),
-                lambda: z1 - 0.01,
-                lambda: z2,
-            )
+    #         z2 = jax.lax.cond(
+    #             (z2 > z1) & ((z2 - z1) < 0.01),
+    #             lambda: z1 + 0.01,
+    #             lambda: z2,
+    #         )
+    #         z2 = jax.lax.cond(
+    #             (z2 < z1) & ((z2 - z1) > -0.01),
+    #             lambda: z1 - 0.01,
+    #             lambda: z2,
+    #         )
 
-            z1_new = jax.lax.cond(z1 < 0.0, lambda: self._b, lambda: z1)
+    #         z1_new = jax.lax.cond(z1 < 0.0, lambda: self._b, lambda: z1)
 
-            func = SersicMissingFlux(self._n, missing_flux).__call__
-            z_root = bisect_for_root(partial(func), z1_new, z2)
-            return z_root
+    #         func = SersicMissingFlux(self._n, missing_flux).__call__
+    #         z_root = bisect_for_root(partial(func), z1_new, z2)
+    #         return z_root
 
-        z = jax.lax.cond(
-            self._n == 0.5,
-            case_n_half,
-            case_general,
-        )
+    #     z = jax.lax.cond(
+    #         self._n == 0.5,
+    #         case_n_half,
+    #         case_general,
+    #     )
 
-        return z**self._n
+    #     return z**self._n
 
-    def _sersic_truncated_scale(self, n, hlr, trunc):
-        """Calculate the truncated scale for the Sersic profile."""
-        return hlr * calculate_truncated_scale(n, 1.0 / n, self._b, trunc / hlr)
+    # def _sersic_truncated_scale(self, n, hlr, trunc):
+    #     """Calculate the truncated scale for the Sersic profile."""
+    #     return hlr * calculate_truncated_scale(n, 1.0 / n, self._b, trunc / hlr)
 
-    def _build_FT(self):
-        def compute_gammaN(p, n, trunc_factor, flux_fraction):
-            z = trunc_factor ** (1.0 / n)
-            return jax.lax.cond(
-                (trunc_factor > 0) & (flux_fraction < 1.0),
-                lambda: gammainc(p, z) * gamma(p),
-                lambda: gamma(p),
-            )
+    # def _build_FT(self, n_ksteps=1000):
 
-        gamma4n = compute_gammaN(
-            4.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
-        )
-        gamma6n = compute_gammaN(
-            6.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
-        )
-        gamma8n = compute_gammaN(
-            8.0 * self._n, self._n, self.trunc_factor, self._flux_fraction
-        )
+    #     def compute_gammaN(self, p):
+    #         z = self.trunc_factor ** (1.0 / self._n)
+    #         return jax.lax.cond(
+    #             (self.trunc_factor > 0) & (self._flux_fraction < 1.0),
+    #             lambda: gammainc(p, z) * gamma(p),
+    #             lambda: gamma(p),
+    #         )
 
-        kderiv2 = -gamma4n / (4.0 * self.gamma2n) / self._flux_fraction
-        kderiv4 = gamma6n / (64.0 * self.gamma2n) / self._flux_fraction
-        kderiv6 = gamma8n / (2304.0 * self.gamma2n) / self._flux_fraction
+    #     gamma4n = compute_gammaN(4.0 * self._n)
+    #     gamma6n = compute_gammaN(6.0 * self._n)
+    #     gamma8n = compute_gammaN(8.0 * self._n)
 
-        kmin = (self.gsparams.kvalue_accuracy / kderiv6) ** (1.0 / 6.0)
-        ksq_min = kmin * kmin
+    #     kderiv2 = -gamma4n / (4.0 * self.gamma2n) / self._flux_fraction
+    #     kderiv4 = gamma6n / (64.0 * self.gamma2n) / self._flux_fraction
+    #     kderiv6 = gamma8n / (2304.0 * self.gamma2n) / self._flux_fraction
 
-        hankel_norm = self._flux_fraction * self._n * self.gamma2n
-        dlogk = self.gsparams.table_spacing * jnp.sqrt(
-            jnp.sqrt(self.gsparams.kvalue_accuracy / 10.0)
-        )
+    #     kmin = (self.gsparams.kvalue_accuracy / kderiv6) ** (1.0 / 6.0)
+    #     ksq_min = kmin * kmin
 
-        # NOTE: should we use jax.lax.while_loop here? when the cost of evaluating
-        # the function is high, it might be worth it...
-        logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
-        k = jnp.exp(logk)
-        ksq = k**2
+    #     hankel_norm = self._flux_fraction * self._n * self.gamma2n
+    #     dlogk_desired = self.gsparams.table_spacing * jnp.sqrt(
+    #         jnp.sqrt(self.gsparams.kvalue_accuracy / 10.0)
+    #     )
 
-        # NOTE: should we use jax.lax.while_loop here? when the cost of evaluating
-        # the function is high, it might be worth it...
-        logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
-        k = jnp.exp(logk)
-        ksq = k**2
+    #     # logk = jnp.arange(jnp.log(kmin) - 0.001, jnp.log(500.0), dlogk)
+    #     logk = jnp.linspace(jnp.log(kmin) - 0.001, jnp.log(500.0), n_ksteps)
+    #     dlogk = (jnp.log(500.0) - (jnp.log(kmin) - 0.001)) / n_ksteps
+    #     k = jnp.exp(logk)
+    #     ksq = k**2
 
-        f = partial(sersic_radial_function, invn=1.0 / self._n)
+    #     f = partial(sersic_radial_function, invn=1.0 / self._n)
 
-        if self.trunc_factor > 0:
-            f_vals = hankel_trunc_zero_order(
-                f,
-                k,
-                self.trunc_factor,
-                (),
-                relerr=self.gsparams.integration_relerr,
-                abserr=self.gsparams.integration_abserr * hankel_norm,
-            )
-        else:
-            f_vals = hankel_inf_zero_order(
-                f,
-                k,
-                (),
-                relerr=self.gsparams.integration_relerr,
-                abserr=self.gsparams.integration_abserr * hankel_norm,
-            )
+    #     if self.trunc_factor > 0:
+    #         f_vals = hankel_trunc_zero_order(
+    #             f,
+    #             k,
+    #             self.trunc_factor,
+    #             (),
+    #             relerr=self.gsparams.integration_relerr,
+    #             abserr=self.gsparams.integration_abserr * hankel_norm,
+    #         )
+    #     else:
+    #         f_vals = hankel_inf_zero_order(
+    #             f,
+    #             k,
+    #             (),
+    #             relerr=self.gsparams.integration_relerr,
+    #             abserr=self.gsparams.integration_abserr * hankel_norm,
+    #         )
 
-        f_vals /= hankel_norm
-        f0_vals = f_vals * ksq
+    #     f_vals /= hankel_norm
+    #     f0_vals = f_vals * ksq
 
-        # Fit a/k^2 + b/k^3 to last `n_fit` values
-        n_fit = 10
-        tail_idx = -n_fit
-        inv_k = 1.0 / k[tail_idx:]
-        f0 = f0_vals[tail_idx:]
+    #     # Fit a/k^2 + b/k^3 to last `n_fit` values
+    #     n_fit = 10
+    #     tail_idx = -n_fit
+    #     inv_k = 1.0 / k[tail_idx:]
+    #     f0 = f0_vals[tail_idx:]
 
-        A = jnp.stack([jnp.ones_like(inv_k), inv_k], axis=1)
-        coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
-        a, b = coeffs
+    #     A = jnp.stack([jnp.ones_like(inv_k), inv_k], axis=1)
+    #     coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
+    #     a, b = coeffs
 
-        # Check if we need to use a larger maxk
-        thres = self.gsparams.maxk_threshold
-        found_maxk = jnp.any(f0_vals < thres)
+    #     # Check if we need to use a larger maxk
+    #     thres = self.gsparams.maxk_threshold
+    #     found_maxk = jnp.any(f0_vals < thres)
 
-        _approx_k_at_thres = jnp.sqrt(
-            (
-                a
-                - b
-                / jnp.sqrt(
-                    (a - b / jnp.sqrt((a - b / jnp.sqrt(a / thres)) / thres)) / thres
-                )
-            )
-            / thres
-        )
+    #     _approx_k_at_thres = jnp.sqrt(
+    #         (
+    #             a
+    #             - b
+    #             / jnp.sqrt(
+    #                 (a - b / jnp.sqrt((a - b / jnp.sqrt(a / thres)) / thres)) / thres
+    #             )
+    #         )
+    #         / thres
+    #     )
 
-        # Predict f0 from high-k approx
-        f0_pred = a + b / k
-        resid = jnp.abs(f0_vals - f0_pred) / ksq
-        within_tol = resid < self.gsparams.kvalue_accuracy
-        has_converged = jnp.any(within_tol)
+    #     # Predict f0 from high-k approx
+    #     f0_pred = a + b / k
+    #     resid = jnp.abs(f0_vals - f0_pred) / ksq
+    #     within_tol = resid < self.gsparams.kvalue_accuracy
+    #     has_converged = jnp.any(within_tol)
 
-        # Find the first k value where high-k approx becomes good
-        ksq_max_idx = jnp.argmax(within_tol)
-        buffer = 5
-        ksq_max_idx_buffered = jnp.minimum(ksq_max_idx + buffer, len(k) - 1)
+    #     # Find the first k value where high-k approx becomes good
+    #     ksq_max_idx = jnp.argmax(within_tol)
+    #     buffer = 5
+    #     ksq_max_idx_buffered = jnp.minimum(ksq_max_idx + buffer, len(k) - 1)
 
-        ksq_max = jnp.where(has_converged, ksq[ksq_max_idx_buffered], ksq[-1])
-        maxk = jnp.sqrt(ksq_max)
+    #     ksq_max = jnp.where(has_converged, ksq[ksq_max_idx_buffered], ksq[-1])
+    #     maxk = jnp.sqrt(ksq_max)
 
-        # Store values for use elsewhere
-        self._kmin = kmin
-        self._ksq_min = ksq_min
-        self._ksq_max = ksq_max
-        self.__maxk = maxk
-        self._kderiv2 = kderiv2
-        self._kderiv4 = kderiv4
-        self._highk_a = a
-        self._highk_b = b
-        self._found_maxk = found_maxk
-        self._approx_k_at_thres = _approx_k_at_thres
+    #     return {
+    #         "kmin": kmin,
+    #         "ksq_min": ksq_min,
+    #         "ksq_max": ksq_max,
+    #         "maxk": maxk,
+    #         "kderiv2": kderiv2,
+    #         "kderiv4": kderiv4,
+    #         "highk_a": a,
+    #         "highk_b": b,
+    #         "found_maxk": found_maxk,
+    #         "_approx_k_at_thres": _approx_k_at_thres,
+    #         "ft_table_logk": logk,
+    #         "ft_table_fvals": f_vals,
+    #         "is_dlogk_good": dlogk < dlogk_desired,
+    #         "dlogk": dlogk,
+    #         "dlogk_desired": dlogk_desired,
+    #     }
 
-        # Build the lookup table
-        self._ft_table_logk = logk
-        self._ft_table_fvals = f_vals
+    #     # # Store values for use elsewhere
+    #     # self._kmin = kmin
+    #     # self._ksq_min = ksq_min
+    #     # self._ksq_max = ksq_max
+    #     # self.__maxk = maxk
+    #     # self._kderiv2 = kderiv2
+    #     # self._kderiv4 = kderiv4
+    #     # self._highk_a = a
+    #     # self._highk_b = b
+    #     # self._found_maxk = found_maxk
+    #     # self._approx_k_at_thres = _approx_k_at_thres
+
+    #     # # Build the lookup table
+    #     # self._ft_table_logk = logk
+    #     # self._ft_table_fvals = f_vals
 
 
 @implements(_galsim.DeVaucouleurs)
