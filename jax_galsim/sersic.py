@@ -218,7 +218,7 @@ def _build_FT(
     f0_vals = f_vals * ksq
 
     # Fit a/k^2 + b/k^3 to last `n_fit` values
-    n_fit = 100
+    n_fit = 10
     tail_idx = -n_fit
     inv_k = 1.0 / k[tail_idx:]
     f0 = f0_vals[tail_idx:]
