@@ -203,7 +203,7 @@ def _build_FT(
     n_fit = 10
     tail_idx = -n_fit
     inv_k = 1.0 / k[tail_idx:]
-    f0 = f0_vals[tail_idx:] * ksq[tail_idx:]
+    f0 = f0_vals[tail_idx:]
 
     A = jnp.stack([jnp.ones_like(inv_k), inv_k], axis=1)
     coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
@@ -211,7 +211,7 @@ def _build_FT(
 
     # Check if we need to use a larger maxk
     thres = maxk_threshold
-    within_thres = jnp.abs(f0_vals) > thres
+    within_thres = jnp.abs(f_vals) > thres
     found_maxk = jnp.any(~within_thres)
 
     _approx_k_at_thres = jnp.sqrt(
