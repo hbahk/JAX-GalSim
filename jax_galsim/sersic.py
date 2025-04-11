@@ -203,7 +203,7 @@ def _build_FT(
     n_fit = 10
     tail_idx = -n_fit
     inv_k = 1.0 / k[tail_idx:]
-    f0 = f0_vals[tail_idx:]
+    f0 = f0_vals[tail_idx:] * ksq[tail_idx:]
 
     A = jnp.stack([jnp.ones_like(inv_k), inv_k], axis=1)
     coeffs, *_ = jnp.linalg.lstsq(A, f0, rcond=None)  # [a, b]
@@ -211,7 +211,8 @@ def _build_FT(
 
     # Check if we need to use a larger maxk
     thres = maxk_threshold
-    found_maxk = jnp.any(f0_vals < thres)
+    within_thres = jnp.abs(f0_vals) > thres
+    found_maxk = jnp.any(~within_thres)
 
     _approx_k_at_thres = jnp.sqrt(
         (
@@ -231,12 +232,15 @@ def _build_FT(
     has_converged = jnp.any(within_tol)
 
     # Find the first k value where high-k approx becomes good
-    ksq_max_idx = jnp.argmax(within_tol)
     buffer = 5
-    ksq_max_idx_buffered = jnp.minimum(ksq_max_idx + buffer, len(k) - 1)
+    ksq_max_idx_tol = jnp.argmax(within_tol) + buffer
+    ksq_max_idx_thres = jnp.argmin(within_thres) + buffer
+    ksq_max_idx_buffered = jnp.maximum(ksq_max_idx_tol, ksq_max_idx_thres)
+    ksq_max_idx = jnp.minimum(ksq_max_idx_buffered, len(k) - 1)
 
-    ksq_max = jnp.where(has_converged, ksq[ksq_max_idx_buffered], ksq[-1])
+    ksq_max = jnp.where(has_converged, ksq[ksq_max_idx], ksq[-1])
     maxk = jnp.sqrt(ksq_max)
+    maxk = jnp.where(found_maxk, maxk * jnp.exp(dlogk), _approx_k_at_thres)
 
     return {
         "kmin": kmin,
@@ -248,9 +252,10 @@ def _build_FT(
         "highk_a": a,
         "highk_b": b,
         "found_maxk": found_maxk,
+        "has_converged": has_converged,
         "_approx_k_at_thres": _approx_k_at_thres,
         "ft_table_logk": logk,
-        "ft_table_fvals": f_vals,
+        "ft_table_fvals": f0_vals,
         "is_dlogk_good": dlogk < dlogk_desired,
         "dlogk": dlogk,
         "dlogk_desired": dlogk_desired,
