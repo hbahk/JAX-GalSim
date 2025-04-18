@@ -145,7 +145,6 @@ def _build_FT(
     integration_relerr,
     integration_abserr,
     maxk_threshold,
-    # n_ksteps=1000,
 ):
 
     _n_ksteps = 1000
@@ -356,7 +355,11 @@ def parse_radius_options(
                 too_small = trunc <= sqrt2 * hlr
 
                 def raise_trunc_err():
-                    return jnp.nan, jnp.nan, jnp.nan  # to raise an error in case of invalid truncation value
+                    return (
+                        jnp.nan,
+                        jnp.nan,
+                        jnp.nan,
+                    )  # to raise an error in case of invalid truncation value
 
                 def good_trunc():
                     b = calculate_b(n, 1.0 / n, gamma2n, 1.0)
@@ -411,14 +414,6 @@ def _compute_sersic_params(
     flux,
     trunc,
     flux_untruncated,
-    # n_ksteps=1000,
-    # kvalue_accuracy=1.0e-5,
-    # table_spacing=1,
-    # integration_relerr=1.0e-6,
-    # integration_abserr=1.0e-8,
-    # maxk_threshold=0.001,
-    # folding_threshold=0.005,
-    # stepk_minimum_hlr=5.0,
 ):
     gamma2n = gamma(2.0 * n)
 
@@ -433,43 +428,14 @@ def _compute_sersic_params(
         flux,
     )
 
-    # Initialize the FT lookup table # TODO: move this to the lazy_property
-    trunc_factor = trunc / r0
-    # ft_result = _build_FT(
-    #     n,
-    #     trunc_factor,
-    #     flux_fraction,
-    #     gamma2n,
-    #     kvalue_accuracy,
-    #     table_spacing,
-    #     integration_relerr,
-    #     integration_abserr,
-    #     maxk_threshold,
-    #     # n_ksteps,
-    # )
-
-    # # Initialize the stepk values # TODO: move this to the lazy_property
-    # R = _calculate_missing_flux_radius(n, gamma2n, b, folding_threshold)
-    # flux_fraction_lt_1 = flux_fraction < 1.0
-    # trunc_factor_lt_R = trunc_factor < R
-    # condi_R = jnp.logical_and(flux_fraction_lt_1, trunc_factor_lt_R)
-    # R = jax.lax.cond(
-    #     condi_R, lambda: trunc_factor, lambda: R
-    # )
-
-    # # Make sure it is at least 5 hlr
-    # R = jnp.max(jnp.array([R, stepk_minimum_hlr * hlr]))
-    # stepk = jnp.pi / R / r0
-    
     return {
         "r0": r0,
         "hlr": hlr,
         "flux": flux_new,
         "flux_fraction": flux_fraction,
         "b": b,
-        # "ft": ft_result,
-        # "stepk": stepk,
     }
+
 
 @implements(_galsim.Sersic)
 @register_pytree_node_class
@@ -494,57 +460,9 @@ class Sersic(GSObject):
         trunc=0.0,
         flux_untruncated=False,
         gsparams=None,
-        # n_ksteps=1000,
     ):
 
         _gsparams = GSParams.check(gsparams)
-
-        # gamma2n = gamma(2.0 * n)
-
-        # def raise_trunc_invalid():
-        #     return jnp.nan  # to raise an error in case of invalid truncation value
-
-        # def ok_trunc():
-        #     return trunc
-
-        # trunc = jax.lax.cond(trunc < 0, raise_trunc_invalid, ok_trunc)
-        # assert trunc >= 0, "Truncation radius must be non-negative"
-
-        # # Parse the radius options
-        # r0, hlr, flux, flux_fraction, b = parse_radius_options(
-        #     n,
-        #     gamma2n,
-        #     trunc,
-        #     flux_untruncated,
-        #     half_light_radius,
-        #     scale_radius,
-        #     flux,
-        # )
-
-        # # Initialize the FT lookup table
-        # trunc_factor = trunc / r0
-        # ft_result = _build_FT(
-        #     n,
-        #     trunc_factor,
-        #     flux_fraction,
-        #     gamma2n,
-        #     _gsparams.kvalue_accuracy,
-        #     _gsparams.table_spacing,
-        #     _gsparams.integration_relerr,
-        #     _gsparams.integration_abserr,
-        #     _gsparams.maxk_threshold,
-        #     n_ksteps,
-        # )
-
-        # # Initialize the stepk values
-        # R = _calculate_missing_flux_radius(n, gamma2n, b, _gsparams.folding_threshold)
-        # R = jax.lax.cond(
-        #     flux_fraction < 1.0 and trunc_factor < R, lambda: trunc_factor, lambda: R
-        # )
-
-        # # Make sure it is at least 5 hlr
-        # R = jnp.max(jnp.array([R, _gsparams.stepk_minimum_hlr])) # TODO: check this. shouldn't this be stepk_minimum_hlr * hlr?
-        # stepk = jnp.pi / R / r0
 
         # Set the Sersic parameters
         self._sersic_params = _compute_sersic_params(
@@ -554,14 +472,6 @@ class Sersic(GSObject):
             flux,
             trunc,
             flux_untruncated,
-            # n_ksteps,
-            # _gsparams.kvalue_accuracy,
-            # _gsparams.table_spacing,
-            # _gsparams.integration_relerr,
-            # _gsparams.integration_abserr,
-            # _gsparams.maxk_threshold,
-            # _gsparams.folding_threshold,
-            # _gsparams.stepk_minimum_hlr,
         )
 
         super().__init__(
@@ -571,10 +481,6 @@ class Sersic(GSObject):
             trunc=trunc,
             gsparams=_gsparams,
         )
-
-        # self._ft = ft_result
-        # self.__stepk = stepk
-        # self.__flux_fraction = flux_fraction
 
     def calculateIntegratedFlux(self, r):
         """Return the fraction of the total flux enclosed within a given radius, r"""
@@ -620,7 +526,7 @@ class Sersic(GSObject):
     def half_light_radius(self):
         """The half-light radius."""
         return self._hlr
-    
+
     @property
     def _hlr(self):
         return self._r0 * self.calculateHLRFactor()
@@ -631,12 +537,10 @@ class Sersic(GSObject):
 
     @property
     def _flux_fraction(self):
-        # return self.__flux_fraction
         return self._sersic_params["flux_fraction"]
 
     @property
     def _b(self):
-        # return calculate_b(self._n, 1.0 / self._n, self.gamma2n, self._flux_fraction)
         return self._sersic_params["b"]
 
     @lazy_property
@@ -718,13 +622,13 @@ class Sersic(GSObject):
     @lazy_property
     def _stepk(self):
         # Initialize the stepk values # TODO: move this to the lazy_property
-        R = _calculate_missing_flux_radius(self._n, self.gamma2n, self._b, self.gsparams.folding_threshold)
+        R = _calculate_missing_flux_radius(
+            self._n, self.gamma2n, self._b, self.gsparams.folding_threshold
+        )
         flux_fraction_lt_1 = self._flux_fraction < 1.0
         trunc_factor_lt_R = self.trunc_factor < R
         condi_R = jnp.logical_and(flux_fraction_lt_1, trunc_factor_lt_R)
-        R = jax.lax.cond(
-            condi_R, lambda: self.trunc_factor, lambda: R
-        )
+        R = jax.lax.cond(condi_R, lambda: self.trunc_factor, lambda: R)
 
         # Make sure it is at least 5 hlr
         R = jnp.max(jnp.array([R, self.gsparams.stepk_minimum_hlr * self._hlr]))
@@ -769,12 +673,6 @@ class Sersic(GSObject):
                 1.0 + ksq * (self._ft["kderiv2"] + ksq * self._ft["kderiv4"]),
                 (self._ft["highk_a"] + self._ft["highk_b"] / jnp.sqrt(ksq)) / ksq,
             ],
-            # jnp.interp(
-            #     0.5 * jnp.log(ksq),
-            #     self._ft["ft_table_logk"],
-            #     self._ft["ft_table_fvals"],
-            # )
-            # / ksq,
             interp1d(
                 0.5 * jnp.log(ksq),
                 self._ft["ft_table_logk"],
